@@ -42,6 +42,10 @@ dependencies:
 
   # For securely storing your future JWT authentication tokens locally on the device
   flutter_secure_storage: ^9.0.0
+  
+# Official AWS Amplify packages for Flutter Authentication
+  amplify_core: ^2.0.0
+  amplify_auth_cognito: ^2.0.0
 
 dev_dependencies:
   flutter_test:
