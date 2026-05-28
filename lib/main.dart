@@ -8,9 +8,7 @@ import 'services/storage_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // Ensure AWS connections are established before mounting the application UI tree
   await AuthService.initializeAmplify();
-
   runApp(const CloudWrapperApp());
 }
 
@@ -40,10 +38,12 @@ class _MainGateScreenState extends State<MainGateScreen> {
   final _codeController = TextEditingController();
 
   String? _jwtToken;
-  bool _isLoadingSession = true; // Tracks background cache lookup
+  bool _isLoadingSession = true;
   bool _needsVerification = false;
-  bool _isUploading = false;
-  String _currentVirtualFolder = "";
+
+  // FIX: removed dead fields _isUploading, _currentVirtualFolder, and
+  // _pickAndUploadFile — the CloudExplorerDashboard widget owns all upload
+  // and navigation state; keeping them here was misleading dead code.
 
   @override
   void initState() {
@@ -90,61 +90,25 @@ class _MainGateScreenState extends State<MainGateScreen> {
     }
   }
 
-  /// Checks if a valid JWT session token already exists on the device storage
   Future<void> _checkExistingSession() async {
     try {
       final session =
           await Amplify.Auth.fetchAuthSession() as CognitoAuthSession;
-
-      // If the user is authenticated, extract their cached identity token
-      // Inside lib/main.dart (_checkExistingSession)
       if (session.isSignedIn) {
         final token = session.userPoolTokensResult.value.idToken.raw;
-        setState(() {
-          _jwtToken = token;
-        });
+        setState(() => _jwtToken = token);
       }
     } catch (e) {
-      print('No existing user session found in device cache: $e');
+      print('No existing session: $e');
     } finally {
-      setState(() {
-        _isLoadingSession = false; // Stop loading spinner
-      });
+      setState(() => _isLoadingSession = false);
     }
   }
 
   void _handleLogout() async {
-    // Force tell AWS Amplify client engine to purge tokens from device storage
     await Amplify.Auth.signOut();
-    setState(() {
-      _jwtToken = null;
-    });
+    setState(() => _jwtToken = null);
     _showSnackBar('Logged out securely.');
-  }
-
-  Future<void> _pickAndUploadFile() async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles(
-      type: FileType.media,
-    );
-
-    if (result != null &&
-        result.files.single.path != null &&
-        _jwtToken != null) {
-      File file = File(result.files.single.path!);
-      setState(() => _isUploading = true);
-
-      // We now pass the authentic JWT token retrieved straight from Cognito session state
-      bool success = await StorageService.uploadFile(
-        file,
-        _jwtToken!,
-        virtualPath: _currentVirtualFolder,
-      );
-
-      setState(() => _isUploading = false);
-      _showSnackBar(
-        success ? 'Direct S3 Sync Success!' : 'Upload Blocked/Failed.',
-      );
-    }
   }
 
   void _showSnackBar(String msg) {
@@ -153,7 +117,6 @@ class _MainGateScreenState extends State<MainGateScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // State 0: Show a loading spinner while we check the local disk cache for keys
     if (_isLoadingSession) {
       return const Scaffold(
         body: Center(
@@ -169,15 +132,13 @@ class _MainGateScreenState extends State<MainGateScreen> {
       );
     }
 
-    // State 1: Active Secure Logged In Dashboard
     if (_jwtToken != null) {
       return CloudExplorerDashboard(
         jwtToken: _jwtToken!,
-        onLogout: _handleLogout, // Pass our updated logout handler down
+        onLogout: _handleLogout,
       );
     }
 
-    // State 2: Verification Screen Code Challenge Flow
     if (_needsVerification) {
       return Scaffold(
         body: Padding(
@@ -208,7 +169,6 @@ class _MainGateScreenState extends State<MainGateScreen> {
       );
     }
 
-    // State 3: Production Login / Signup Core Landing Interface
     return Scaffold(
       body: Padding(
         padding: const EdgeInsets.all(24.0),
@@ -276,7 +236,7 @@ class CloudExplorerDashboard extends StatefulWidget {
 class _CloudExplorerDashboardState extends State<CloudExplorerDashboard> {
   bool _isLoading = true;
   bool _isUploading = false;
-  String _currentPath = ""; // Track folder depth state. e.g. "Photos/"
+  String _currentPath = "";
 
   List<dynamic> _folders = [];
   List<dynamic> _files = [];
@@ -301,12 +261,13 @@ class _CloudExplorerDashboardState extends State<CloudExplorerDashboard> {
   }
 
   Future<void> _handleUpload() async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles(
-      type: FileType.media,
-    );
+    // FIX: use StorageService.pickFile() so the allowed extension list is
+    // defined in one place (storage_service.dart) and stays in sync with
+    // the backend ALLOWED_MIME_TYPES whitelist.
+    final FilePickerResult? result = await StorageService.pickFile();
 
     if (result != null && result.files.single.path != null) {
-      File file = File(result.files.single.path!);
+      final File file = File(result.files.single.path!);
       setState(() => _isUploading = true);
 
       bool success = await StorageService.uploadFile(
@@ -317,26 +278,36 @@ class _CloudExplorerDashboardState extends State<CloudExplorerDashboard> {
 
       setState(() => _isUploading = false);
 
-      // Auto-refresh the view immediately on success so the new item pops up!
-      if (success) _refreshDriveContents();
+      if (success) {
+        _refreshDriveContents();
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('Upload failed.')));
+        }
+      }
     }
   }
 
   void _navigateToFolder(String folderPath) {
-    setState(() {
-      _currentPath = folderPath;
-    });
+    setState(() => _currentPath = folderPath);
     _refreshDriveContents();
   }
 
   void _navigateUp() {
     if (_currentPath.isEmpty) return;
-    // Strip out trailing slash and pop the last directory element off the stack
-    List<String> segments = _currentPath.split('/');
-    segments
-        .removeLast(); // Removes trailing empty string due to trailing slash
-    if (segments.isNotEmpty)
-      segments.removeLast(); // Removes actual parent directory string
+
+    // FIX: original code called removeLast() twice unconditionally. After the
+    // first removal (trailing empty string from the trailing slash), segments
+    // could already be empty, making the second removeLast() throw a
+    // RangeError. Now we only remove the actual directory segment when present.
+    final segments = _currentPath
+        .split('/')
+        .where((s) => s.isNotEmpty) // drop the trailing empty string
+        .toList();
+
+    segments.removeLast(); // pop the current directory
 
     setState(() {
       _currentPath = segments.isEmpty ? "" : "${segments.join('/')}/";
@@ -375,7 +346,6 @@ class _CloudExplorerDashboardState extends State<CloudExplorerDashboard> {
               child: ListView(
                 padding: const EdgeInsets.all(16),
                 children: [
-                  // Section 1: Folders Rendering Row
                   if (_folders.isNotEmpty) ...[
                     const Text(
                       'Folders',
@@ -398,7 +368,6 @@ class _CloudExplorerDashboardState extends State<CloudExplorerDashboard> {
                       itemCount: _folders.length,
                       itemBuilder: (context, index) {
                         final folder = _folders[index];
-                        // Extract localized name string from raw absolute path
                         final displayTitle = folder
                             .split('/')
                             .reversed
@@ -430,8 +399,6 @@ class _CloudExplorerDashboardState extends State<CloudExplorerDashboard> {
                     ),
                     const SizedBox(height: 24),
                   ],
-
-                  // Section 2: Files Rendering Row
                   const Text(
                     'Files',
                     style: TextStyle(

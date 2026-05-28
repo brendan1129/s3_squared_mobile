@@ -1,12 +1,35 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
+import 'package:file_picker/file_picker.dart';
 
 class StorageService {
   static const String _apiBaseUrl =
-      'https://mu4zwvl8i0.execute-api.us-east-1.amazonaws.com';
+      'https://bkc6flglnh.execute-api.us-east-1.amazonaws.com';
 
-  // Inject the user's active login token into the upload pipeline parameters
+  // FIX: MIME map now covers every type the backend ALLOWED_MIME_TYPES accepts.
+  // Previously gif/mov/pdf were missing — any of those file types would fall through
+  // to 'image/jpeg', the backend's MIME check would reject them with a 403.
+  static const Map<String, String> _mimeTypes = {
+    'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg',
+    'png': 'image/png',
+    'gif': 'image/gif',
+    'mp4': 'video/mp4',
+    'mov': 'video/quicktime',
+    'pdf': 'application/pdf',
+  };
+
+  // FIX: was FileType.media which hides PDFs (images/video only).
+  // FileType.custom with an explicit allowedExtensions list matches the backend
+  // whitelist exactly so the picker and the server stay in sync.
+  static Future<FilePickerResult?> pickFile() {
+    return FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['jpg', 'jpeg', 'png', 'gif', 'mp4', 'mov', 'pdf'],
+    );
+  }
+
   static Future<bool> uploadFile(
     File file,
     String jwtToken, {
@@ -16,16 +39,17 @@ class StorageService {
       final String fileName = file.path.split('/').last;
       final String ext = fileName.split('.').last.toLowerCase();
 
-      // Enforce file extension parameter sync mapping matching the backend configuration rules
-      String mimeType = 'image/jpeg';
-      if (ext == 'png') mimeType = 'image/png';
-      if (ext == 'mp4') mimeType = 'video/mp4';
+      final String? mimeType = _mimeTypes[ext];
+      if (mimeType == null) {
+        // Extension not in whitelist — backend will reject it; fail fast here
+        print('Unsupported file extension: .$ext');
+        return false;
+      }
 
       final http.Response response = await http.post(
         Uri.parse('$_apiBaseUrl/request-upload'),
         headers: {
           'Content-Type': 'application/json',
-          // Pass the JWT token explicitly to passing authorizer checks
           'Authorization': jwtToken,
         },
         body: jsonEncode({
@@ -35,16 +59,14 @@ class StorageService {
       );
 
       if (response.statusCode != 200) {
-        print(
-          'Authorization upload token generation rejection error: ${response.body}',
-        );
+        print('Upload token rejection: ${response.body}');
         return false;
       }
 
       final Map<String, dynamic> data = jsonDecode(response.body);
       final String uploadUrl = data['uploadUrl'];
 
-      // Direct S3 transfer requires no authorization headers (handled inside query parameters)
+      // Direct S3 transfer — no auth headers, credentials are in the signed URL
       final http.Response s3Response = await http.put(
         Uri.parse(uploadUrl),
         headers: {'Content-Type': mimeType},
@@ -53,18 +75,16 @@ class StorageService {
 
       return s3Response.statusCode == 200;
     } catch (e) {
-      print('Pipeline failure tracking details: $e');
+      print('Upload pipeline error: $e');
       return false;
     }
   }
 
-  /// Fetches files and virtual subfolders from S3 for the current directory path
   static Future<Map<String, List<dynamic>>> fetchDirectoryContents(
     String jwtToken, {
     String virtualPath = "",
   }) async {
     try {
-      // Pass the current folder depth as a URL query parameter
       final Uri url = Uri.parse('$_apiBaseUrl/list-files?prefix=$virtualPath');
 
       final http.Response response = await http.get(
@@ -76,11 +96,11 @@ class StorageService {
         final Map<String, dynamic> data = jsonDecode(response.body);
         return {'folders': data['folders'] ?? [], 'files': data['files'] ?? []};
       } else {
-        print('Failed to read cloud drive directory status: ${response.body}');
+        print('Directory fetch failed: ${response.body}');
         return {'folders': [], 'files': []};
       }
     } catch (e) {
-      print('Directory lookup pipeline crash exception tracking: $e');
+      print('Directory fetch error: $e');
       return {'folders': [], 'files': []};
     }
   }

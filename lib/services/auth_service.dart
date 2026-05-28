@@ -3,9 +3,9 @@ import 'package:amplify_core/amplify_core.dart';
 
 class AuthService {
   static const String _userPoolId =
-      'us-east-1_EN5lKzo0m'; // Replace with your User Pool ID
+      'us-east-1_wh9Qiq2kk'; // Replace with your User Pool ID
   static const String _clientId =
-      '5q4anpk5dom2md9q7udb4vd5lo'; // Replace with your App Client ID
+      '1ju9f7jlit5iq7ubi6odibmmah'; // Replace with your App Client ID
   static const String _region = 'us-east-1';
 
   /// Configures the native Amplify plugin with your AWS infrastructure settings
