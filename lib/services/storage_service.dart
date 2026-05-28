@@ -1,15 +1,11 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
-import 'package:file_picker/file_picker.dart';
 
 class StorageService {
   static const String _apiBaseUrl =
       'https://bkc6flglnh.execute-api.us-east-1.amazonaws.com';
 
-  // FIX: MIME map now covers every type the backend ALLOWED_MIME_TYPES accepts.
-  // Previously gif/mov/pdf were missing — any of those file types would fall through
-  // to 'image/jpeg', the backend's MIME check would reject them with a 403.
   static const Map<String, String> _mimeTypes = {
     'jpg': 'image/jpeg',
     'jpeg': 'image/jpeg',
@@ -20,15 +16,14 @@ class StorageService {
     'pdf': 'application/pdf',
   };
 
-  // FIX: was FileType.media which hides PDFs (images/video only).
-  // FileType.custom with an explicit allowedExtensions list matches the backend
-  // whitelist exactly so the picker and the server stay in sync.
-  static Future<FilePickerResult?> pickFile() {
-    return FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['jpg', 'jpeg', 'png', 'gif', 'mp4', 'mov', 'pdf'],
-    );
-  }
+  static Map<String, String> _authHeaders(String jwt) => {'Authorization': jwt};
+
+  static Map<String, String> _jsonHeaders(String jwt) => {
+    'Content-Type': 'application/json',
+    'Authorization': jwt,
+  };
+
+  // ── Upload ──────────────────────────────────────────────────────────────────
 
   static Future<bool> uploadFile(
     File file,
@@ -38,70 +33,155 @@ class StorageService {
     try {
       final String fileName = file.path.split('/').last;
       final String ext = fileName.split('.').last.toLowerCase();
-
       final String? mimeType = _mimeTypes[ext];
       if (mimeType == null) {
-        // Extension not in whitelist — backend will reject it; fail fast here
-        print('Unsupported file extension: .$ext');
+        print('Unsupported extension: .$ext');
         return false;
       }
 
-      final http.Response response = await http.post(
+      final response = await http.post(
         Uri.parse('$_apiBaseUrl/request-upload'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': jwtToken,
-        },
+        headers: _jsonHeaders(jwtToken),
         body: jsonEncode({
           'fileName': '$virtualPath$fileName',
           'mimeType': mimeType,
         }),
       );
-
       if (response.statusCode != 200) {
         print('Upload token rejection: ${response.body}');
         return false;
       }
 
-      final Map<String, dynamic> data = jsonDecode(response.body);
-      final String uploadUrl = data['uploadUrl'];
-
-      // Direct S3 transfer — no auth headers, credentials are in the signed URL
-      final http.Response s3Response = await http.put(
+      final String uploadUrl = jsonDecode(response.body)['uploadUrl'];
+      final s3Response = await http.put(
         Uri.parse(uploadUrl),
         headers: {'Content-Type': mimeType},
         body: await file.readAsBytes(),
       );
-
       return s3Response.statusCode == 200;
     } catch (e) {
-      print('Upload pipeline error: $e');
+      print('Upload error: $e');
       return false;
     }
   }
+
+  // ── List ────────────────────────────────────────────────────────────────────
 
   static Future<Map<String, List<dynamic>>> fetchDirectoryContents(
     String jwtToken, {
     String virtualPath = "",
   }) async {
     try {
-      final Uri url = Uri.parse('$_apiBaseUrl/list-files?prefix=$virtualPath');
-
-      final http.Response response = await http.get(
-        url,
-        headers: {'Authorization': jwtToken},
+      final response = await http.get(
+        Uri.parse('$_apiBaseUrl/list-files?prefix=$virtualPath'),
+        headers: _authHeaders(jwtToken),
       );
-
       if (response.statusCode == 200) {
-        final Map<String, dynamic> data = jsonDecode(response.body);
+        final data = jsonDecode(response.body);
         return {'folders': data['folders'] ?? [], 'files': data['files'] ?? []};
-      } else {
-        print('Directory fetch failed: ${response.body}');
-        return {'folders': [], 'files': []};
       }
-    } catch (e) {
-      print('Directory fetch error: $e');
+      print('List failed: ${response.body}');
       return {'folders': [], 'files': []};
+    } catch (e) {
+      print('List error: $e');
+      return {'folders': [], 'files': []};
+    }
+  }
+
+  // ── Download URL ────────────────────────────────────────────────────────────
+
+  static Future<String?> getDownloadUrl(String jwtToken, String fileKey) async {
+    try {
+      final response = await http.get(
+        Uri.parse(
+          '$_apiBaseUrl/download-url?key=${Uri.encodeComponent(fileKey)}',
+        ),
+        headers: _authHeaders(jwtToken),
+      );
+      if (response.statusCode == 200)
+        return jsonDecode(response.body)['downloadUrl'] as String;
+      print('Download URL failed: ${response.body}');
+      return null;
+    } catch (e) {
+      print('Download URL error: $e');
+      return null;
+    }
+  }
+
+  // ── Delete ──────────────────────────────────────────────────────────────────
+
+  static Future<bool> deleteFile(String jwtToken, String fileKey) async {
+    try {
+      final response = await http.delete(
+        Uri.parse('$_apiBaseUrl/delete-file'),
+        headers: _jsonHeaders(jwtToken),
+        body: jsonEncode({'fileKey': fileKey}),
+      );
+      return response.statusCode == 200;
+    } catch (e) {
+      print('Delete error: $e');
+      return false;
+    }
+  }
+
+  // ── Rename ──────────────────────────────────────────────────────────────────
+
+  static Future<bool> renameFile(
+    String jwtToken,
+    String fileKey,
+    String newName,
+  ) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$_apiBaseUrl/rename-file'),
+        headers: _jsonHeaders(jwtToken),
+        body: jsonEncode({'fileKey': fileKey, 'newName': newName}),
+      );
+      return response.statusCode == 200;
+    } catch (e) {
+      print('Rename error: $e');
+      return false;
+    }
+  }
+
+  // ── Move ────────────────────────────────────────────────────────────────────
+
+  /// [destinationFolder] is the target folder path with trailing slash,
+  /// or empty string "" to move to the root.
+  static Future<bool> moveFile(
+    String jwtToken,
+    String sourceKey,
+    String destinationFolder,
+  ) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$_apiBaseUrl/move-file'),
+        headers: _jsonHeaders(jwtToken),
+        body: jsonEncode({
+          'sourceKey': sourceKey,
+          'destinationFolder': destinationFolder,
+        }),
+      );
+      return response.statusCode == 200;
+    } catch (e) {
+      print('Move error: $e');
+      return false;
+    }
+  }
+
+  // ── Create folder ───────────────────────────────────────────────────────────
+
+  static Future<bool> createFolder(String jwtToken, String folderPath) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$_apiBaseUrl/create-folder'),
+        headers: _jsonHeaders(jwtToken),
+        body: jsonEncode({'folderPath': folderPath}),
+      );
+      return response.statusCode == 200;
+    } catch (e) {
+      print('Create folder error: $e');
+      return false;
     }
   }
 }
